@@ -58,9 +58,7 @@ impl Ord for NonterminalSet {
 
 impl Display for NonterminalSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.maybe_get_from_singleton() {
-            Some(ident) => write!(f, "{}", ident),
-            None => write!(f, "{:?}", self),
-        }
+        let pat = &self.0;
+        write!(f, "{}", quote!(#pat))
     }
 }
