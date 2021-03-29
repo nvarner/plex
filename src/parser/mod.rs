@@ -295,7 +295,7 @@ where
             let err_msg = expected_one_of(&expected);
             arms.push(quote!(_ => return Err((token_span, #err_msg)),));
             let ix = ix as u32;
-            quote!(#ix => match token_span { #(#arms)* })
+            quote!(#ix => match &token_span { #(#arms)* })
         });
         quote!(
             loop {
