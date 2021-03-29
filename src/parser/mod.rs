@@ -1,14 +1,16 @@
+mod nonterminal_set;
+
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write};
 
 use lalr::*;
 
+use parser::nonterminal_set::NonterminalSet;
 use proc_macro;
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
 use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{self, token, Attribute, Block, Expr, Ident, Meta, NestedMeta, Pat, Type, Visibility};
 
@@ -182,37 +184,51 @@ where
                 )
             };
             let mut reduce_stmts = vec![current_span_stmt];
-            reduce_stmts.extend(rhs.syms.iter().zip(arg_pats.iter().cloned()).rev().map(
-                |(sym, maybe_pat)| match maybe_pat {
-                    // TODO: maybe use an even more precise span
-                    Some(pat) => {
-                        let ty = match *sym {
-                            Terminal(_) => token_ty.clone(),
-                            Nonterminal(ref n) => types[n].clone(),
-                        };
-                        quote_spanned!(rhs_span =>
-                            let #pat: #ty = *stack.pop().unwrap().downcast().unwrap();
-                        )
-                    }
-                    None => quote_spanned!(rhs_span => stack.pop();),
-                },
-            ));
+
+            // Deepest level
+            let mut deepest_stmts = vec![];
             if rhs.syms.len() > 1 {
                 let len_minus_one = rhs.syms.len() - 1;
                 // XXX: Annoying syntax :(
-                reduce_stmts.push(
+                deepest_stmts.push(
                     quote_spanned!(rhs_span => match state_stack.len() - #len_minus_one { x => state_stack.truncate(x) };),
                 );
             } else if rhs.syms.len() == 0 {
-                reduce_stmts.push(quote_spanned!(rhs_span => state_stack.push(*state);));
+                deepest_stmts.push(quote_spanned!(rhs_span => state_stack.push(*state);));
             }
-            reduce_stmts.push(quote_spanned!(
+            deepest_stmts.push(quote_spanned!(
                 rhs_span =>
                 *state = #goto_fn(*state_stack.last().unwrap());
                 let result: #lhs_ty = ( || -> #lhs_ty { #result } )();
                 stack.push(Box::new(result) as Box<#any_ty>);
                 span_stack.push(current_span);
             ));
+
+            reduce_stmts.push(rhs.syms.iter().zip(arg_pats.iter().cloned()).fold(
+                quote_spanned!(rhs_span => #(#deepest_stmts)*),
+                |deeper, (sym, maybe_pat)| match maybe_pat {
+                    // TODO: maybe use an even more precise span
+                    Some(pat) => {
+                        println!("{:?}", sym);
+                        println!("{:?}", pat);
+                        println!();
+                        let ty = match *sym {
+                            Terminal(_) => token_ty.clone(),
+                            Nonterminal(ref n) => types[n].clone(),
+                        };
+                        quote_spanned!(rhs_span =>
+                            if let #pat = *stack.pop().unwrap().downcast::<#ty>().unwrap() {
+                                #deeper
+                            }
+                        )
+                    }
+                    None => {
+                        println!("{:?}", sym);
+                        quote_spanned!(rhs_span => stack.pop(); #deeper)
+                    },
+                },
+            ));
+
 
             let fn_id = rule_fn_ids.get(&(rhs as *const _)).unwrap().clone();
             stmts.push(quote_spanned!(
@@ -238,7 +254,7 @@ where
     stmts.push({
         let state_arms = table.states.iter().enumerate().map(|(ix, state)| {
             let mut arms = vec![];
-            let mut reduce_arms = BTreeMap::new();
+            let mut reduce_arms = Vec::new();
             let mut expected = vec![];
             for (&tok, action) in &state.lookahead {
                 expected.push(format!("`{}`", tok));
@@ -247,10 +263,7 @@ where
                 let arm_expr = match *action {
                     LRAction::Shift(dest) => dest as u32,
                     LRAction::Reduce(_, rhs) => {
-                        reduce_arms
-                            .entry(rhs as *const _)
-                            .or_insert(vec![])
-                            .push(pat);
+                        reduce_arms.push((rhs as *const _, pat));
                         continue;
                     }
                     LRAction::Accept => unreachable!(),
@@ -263,10 +276,7 @@ where
                 match *action {
                     LRAction::Shift(_) => unreachable!(),
                     LRAction::Reduce(_, rhs) => {
-                        reduce_arms
-                            .entry(rhs as *const _)
-                            .or_insert(vec![])
-                            .push(pat);
+                        reduce_arms.push((rhs as *const _, pat));
                     }
                     LRAction::Accept => {
                         arms.push(
@@ -275,9 +285,9 @@ where
                     }
                 };
             }
-            for (rhs_ptr, pats) in reduce_arms.into_iter() {
+            for (rhs_ptr, pat) in reduce_arms.into_iter() {
                 let reduce_fn = rule_fn_ids[&rhs_ptr].clone();
-                arms.push(quote!(#(#pats)|* => {
+                arms.push(quote!(#pat => {
                     #reduce_fn(&mut stack, &mut span_stack, &mut state_stack, &mut state);
                     continue
                 }));
@@ -316,22 +326,15 @@ where
 
 #[derive(Debug)]
 enum RuleRhsItem {
-    Symbol(Ident),
-    SymbolPat(Ident, Pat),
-    Destructure(
-        Ident,
-        /// The span of the parens surrounding the patterns.
-        Span,
-        Vec<Pat>,
-    ),
+    Match(NonterminalSet),
+    /// (match_to, bind_to)
+    MatchBind(NonterminalSet, Pat),
 }
 
 impl RuleRhsItem {
-    fn ident(&self) -> &Ident {
+    fn match_to(&self) -> &NonterminalSet {
         match *self {
-            RuleRhsItem::Symbol(ref ident)
-            | RuleRhsItem::SymbolPat(ref ident, _)
-            | RuleRhsItem::Destructure(ref ident, _, _) => ident,
+            RuleRhsItem::Match(ref match_to) | RuleRhsItem::MatchBind(ref match_to, _) => match_to,
         }
     }
 }
@@ -342,7 +345,7 @@ struct Rule {
     // `None` if `rhs` is empty
     rhs_span: proc_macro::Span,
     action: TokenStream,
-    exclusions: BTreeSet<Ident>,
+    exclusions: Vec<NonterminalSet>,
     exclude_eof: bool,
     priority: i32,
 }
@@ -351,7 +354,7 @@ fn parse_rules(input: ParseStream) -> syn::Result<Vec<Rule>> {
     let mut rules = vec![];
     while !input.is_empty() {
         // FIXME: Make some nicer error messages.
-        let mut exclusions = BTreeSet::new();
+        let mut exclusions = Vec::new();
         let mut exclude_eof = false;
         let mut priority = 0;
         let attrs = Attribute::parse_outer(input)?;
@@ -365,7 +368,7 @@ fn parse_rules(input: ParseStream) -> syn::Result<Vec<Rule>> {
                             if ident == "EOF" {
                                 exclude_eof = true;
                             } else {
-                                exclusions.insert(ident.clone());
+                                exclusions.push(NonterminalSet::new_singleton(ident.clone()));
                             }
                         } else {
                             // FIXME bad span here
@@ -394,32 +397,22 @@ fn parse_rules(input: ParseStream) -> syn::Result<Vec<Rule>> {
         let mut sp_lo = None;
         let mut sp_hi = None;
         while !input.peek(Token![=>]) {
-            let ident: Ident = input.parse()?;
+            let match_to: Pat = input.parse()?;
             if sp_lo.is_none() {
-                sp_lo = Some(ident.span());
+                sp_lo = Some(match_to.span());
             }
             rhs.push(if input.peek(token::Bracket) {
                 let inner;
                 let bracket = bracketed!(inner in input);
                 sp_hi = Some(bracket.span);
-                let pat = inner.parse()?;
+                let bind_to = inner.parse()?;
                 if !inner.is_empty() {
                     return Err(inner.error("unexpected token after pattern"));
                 }
-                RuleRhsItem::SymbolPat(ident, pat)
-            } else if input.peek(token::Paren) {
-                let inner;
-                let paren = parenthesized!(inner in input);
-                sp_hi = Some(paren.span);
-                let pats = Punctuated::<Pat, Token![,]>::parse_terminated(&inner)?;
-                RuleRhsItem::Destructure(
-                    ident,
-                    paren.span,
-                    pats.into_pairs().map(|p| p.into_value()).collect(),
-                )
+                RuleRhsItem::MatchBind(NonterminalSet(match_to), bind_to)
             } else {
-                sp_hi = Some(ident.span());
-                RuleRhsItem::Symbol(ident)
+                sp_hi = Some(match_to.span());
+                RuleRhsItem::Match(NonterminalSet(match_to))
             });
         }
         let arrow = input.parse::<Token![=>]>()?;
@@ -535,7 +528,7 @@ impl Parse for Parser {
     }
 }
 
-fn pretty_rule(lhs: Ident, syms: &[Symbol<Ident, Ident>]) -> String {
+fn pretty_rule(lhs: Ident, syms: &[Symbol<NonterminalSet, NonterminalSet>]) -> String {
     let mut r = String::new();
     let _ = write!(&mut r, "{} ->", lhs);
     for sym in syms.iter() {
@@ -545,7 +538,7 @@ fn pretty_rule(lhs: Ident, syms: &[Symbol<Ident, Ident>]) -> String {
 }
 
 // Pretty-print an item set, for error messages.
-fn pretty(x: &ItemSet<Ident, Ident, &Rule>, pad: &str) -> String {
+fn pretty(x: &ItemSet<NonterminalSet, NonterminalSet, &Rule>, pad: &str) -> String {
     let mut r = String::new();
     let mut first = true;
     for item in x.items.iter() {
@@ -576,18 +569,21 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         // parse "LHS: Type {"
         let lhs = &rule_set.lhs;
         if start.is_none() {
-            start = Some(lhs.clone());
+            start = Some(NonterminalSet::new_singleton(lhs.clone()));
         }
-        match rules.entry(lhs.clone()) {
+        match rules.entry(NonterminalSet::new_singleton(lhs.clone())) {
             Entry::Occupied(ent) => {
                 lhs.span()
                     .unstable()
                     .error("duplicate nonterminal")
-                    .span_note(ent.key().span().unstable(), "first definition here")
+                    .span_note(ent.key().0.span().unstable(), "first definition here")
                     .emit();
             }
             Entry::Vacant(ent) => {
-                types.insert(lhs.clone(), rule_set.return_ty.clone());
+                types.insert(
+                    NonterminalSet::new_singleton(lhs.clone()),
+                    rule_set.return_ty.clone(),
+                );
                 ent.insert(&rule_set.rules);
             }
         }
@@ -601,7 +597,7 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             .emit();
         return proc_macro::TokenStream::new();
     };
-    let mut rules: BTreeMap<Ident, Vec<_>> = rules
+    let mut rules: BTreeMap<NonterminalSet, Vec<_>> = rules
         .into_iter()
         .map(|(lhs, rules)| {
             let rhss = rules
@@ -612,11 +608,11 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                         .rhs
                         .iter()
                         .map(|tok| {
-                            let ident = tok.ident().clone();
-                            if types.contains_key(&ident) {
-                                Nonterminal(ident)
+                            let match_to = tok.match_to().clone();
+                            if types.contains_key(&match_to) {
+                                Nonterminal(match_to)
                             } else {
-                                Terminal(ident)
+                                Terminal(match_to)
                             }
                         })
                         .collect();
@@ -629,12 +625,12 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             (lhs, rhss)
         })
         .collect();
-    let fake_start = Ident::new("__FIXME__start", Span::call_site());
+    let fake_start = NonterminalSet::new_singleton(Ident::new("__FIXME__start", Span::call_site()));
     fake_rule = Rule {
         rhs: vec![],
         rhs_span: proc_macro::Span::call_site(),
         action: quote!(),
-        exclusions: BTreeSet::new(),
+        exclusions: vec![],
         exclude_eof: false,
         priority: -1,
     };
@@ -646,10 +642,10 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         }],
     );
     let grammar = Grammar {
-        rules: rules,
+        rules,
         start: fake_start,
     };
-    lr1_machine(
+    lr1_machine::<NonterminalSet, NonterminalSet, _, _, _, _, _>(
         &grammar,
         &types,
         parser.token_ty,
@@ -657,45 +653,24 @@ pub fn parser(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         parser.range_fn,
         parser.vis,
         parser.name,
-        |ident| quote!(#ident { .. }),
+        |nonterminal_set| {
+            let pat = &nonterminal_set.0;
+            quote!(#pat)
+        },
         |lhs, act, syms| {
             let mut expr = act.action.clone().into_token_stream();
             let mut args = vec![];
             debug_assert_eq!(syms.len(), act.rhs.len());
             for (i, (sym, x)) in syms.iter().zip(&act.rhs).enumerate() {
                 args.push(match *x {
-                    RuleRhsItem::SymbolPat(_, ref pat) => Some(pat.clone().into_token_stream()),
-                    RuleRhsItem::Destructure(ref ident, sp, ref pats) => {
-                        let id = Ident::new(&format!("s{}", i), Span::call_site());
-                        let terminal = match *sym {
-                            Nonterminal(_) => {
-                                sp.unstable()
-                                    .error("can't bind enum case to a nonterminal")
-                                    .emit();
-                                Ident::new("__error", Span::call_site())
-                            }
-                            Terminal(ref x) => {
-                                debug_assert_eq!(*x, ident.to_string());
-                                x.clone()
-                            }
-                        };
-                        expr = quote_spanned!(act.rhs_span.into() =>
-                        {
-                            // force a by-move capture
-                            match {#id} {
-                                #terminal(#(#pats),*) => #expr,
-                                _ => unreachable!(),
-                            }
-                        });
-                        Some(id.into_token_stream())
-                    }
-                    RuleRhsItem::Symbol(_) => None,
+                    RuleRhsItem::MatchBind(ref match_to, ref bind_to) => Some(bind_to.clone().into_token_stream()),
+                    RuleRhsItem::Match(NonterminalSet(ref match_to)) => Some(match_to.clone().into_token_stream()),
                 });
             }
 
             // XXX: should be a cargo feature (?)
             if false {
-                let rule_str = pretty_rule(lhs.clone(), syms);
+                let rule_str = pretty_rule(lhs.get_from_singleton(), syms);
                 expr = quote!({
                     println!("reduce by {}", #rule_str);
                     #expr
